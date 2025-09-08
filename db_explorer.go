@@ -38,6 +38,10 @@ type GetTableItemsResponse struct {
 	Records []map[string]any `json:"records"`
 }
 
+type GetTableItemResponse struct {
+	Record map[string]any `json:"record"`
+}
+
 type ErrorResponse struct {
 	Error string `json:"error"`
 }
@@ -285,6 +289,13 @@ func (exp DbExplorer) getTableName(url string) (string, error) {
 	return tableName, nil
 }
 
+// todo: нужна проверка на инт?
+func (exp DbExplorer) getId(url string) (string, error) {
+	id := strings.Split(url, "/")[2]
+
+	return id, nil
+}
+
 func (exp DbExplorer) handlerGetTableItems(w http.ResponseWriter, r *http.Request) {
 	tableName, err := exp.getTableName(r.URL.Path)
 	if err != nil {
@@ -317,8 +328,86 @@ func (exp DbExplorer) handlerGetTableItems(w http.ResponseWriter, r *http.Reques
 	w.Write(data)
 }
 
-func (exp DbExplorer) handlerGetTableItem(w http.ResponseWriter, r *http.Request) {
+func (exp DbExplorer) getItem(table string, id string) (map[string]any, error) {
+	res := make(map[string]any)
 
+	row := exp.DB.QueryRow(fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table), id)
+	if row.Err() != nil {
+		return res, row.Err()
+	}
+
+	rows, err := exp.DB.Query(fmt.Sprintf("SELECT * FROM %s LIMIT 0", table))
+	if err != nil {
+		return res, err
+	}
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return res, err
+	}
+
+	columnTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return res, err
+	}
+
+	values := make([]any, len(columns))
+	for i := range values {
+		if isStringType(columnTypes[i].DatabaseTypeName()) {
+			values[i] = new(sql.NullString)
+		} else {
+			values[i] = new(any)
+		}
+	}
+
+	err = row.Scan(values...)
+	if err != nil {
+		return res, err
+	}
+
+	for i, v := range values {
+		strOrNil, ok := v.(*sql.NullString)
+		if ok {
+			if strOrNil.Valid {
+				res[columns[i]] = strOrNil.String
+			} else {
+				res[columns[i]] = nil
+			}
+		} else {
+			res[columns[i]] = v
+		}
+	}
+
+	return res, nil
+}
+
+func (exp DbExplorer) handlerGetTableItem(w http.ResponseWriter, r *http.Request) {
+	tableName, err := exp.getTableName(r.URL.Path)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write(NewErrorResponse(err))
+		return
+	}
+
+	id, _ := exp.getId(r.URL.Path)
+
+	item, err := exp.getItem(tableName, id)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write(NewErrorResponse(fmt.Errorf("record not found")))
+		return
+	}
+
+	res := GetTableItemResponse{
+		Record: item,
+	}
+
+	resp := Response{
+		Response: res,
+	}
+
+	data, _ := json.Marshal(resp)
+	w.Write(data)
 }
 
 func (exp DbExplorer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
