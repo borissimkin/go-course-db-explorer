@@ -69,43 +69,7 @@ func (r *Router) Handle(method string, pattern string, handler http.HandlerFunc)
 type DbExplorer struct {
 	DB         *sql.DB
 	TableNames []string
-	Columns    map[string][]string
 	router     *Router
-}
-
-func (exp DbExplorer) getTableColumns(table string) ([]string, error) {
-	columns := make([]string, 0)
-
-	rows, err := exp.DB.Query("SHOW FULL COLUMNS FROM ?", table)
-	if err != nil {
-		return columns, nil
-	}
-
-	defer rows.Close()
-
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return columns, err
-		}
-
-		columns = append(columns, name)
-	}
-
-	return columns, nil
-}
-
-func (exp DbExplorer) initColumns() error {
-	for _, table := range exp.TableNames {
-		columns, err := exp.getTableColumns(table)
-		if err != nil {
-			return err
-		}
-
-		exp.Columns[table] = columns
-	}
-
-	return nil
 }
 
 func isStringType(columnType string) bool {
@@ -202,9 +166,8 @@ func (exp DbExplorer) getTableNames() ([]string, error) {
 
 func NewDbExplorer(db *sql.DB) (DbExplorer, error) {
 	explorer := DbExplorer{
-		DB:      db,
-		router:  NewRouter(),
-		Columns: make(map[string][]string),
+		DB:     db,
+		router: NewRouter(),
 	}
 
 	tableNames, err := explorer.getTableNames()
@@ -213,11 +176,6 @@ func NewDbExplorer(db *sql.DB) (DbExplorer, error) {
 	}
 
 	explorer.TableNames = tableNames
-
-	err = explorer.initColumns()
-	if err != nil {
-		return explorer, err
-	}
 
 	explorer.initRoutes()
 
@@ -228,6 +186,139 @@ func (exp DbExplorer) initRoutes() {
 	exp.router.Handle(http.MethodGet, "/", exp.handlerGetTableNames)
 	exp.router.Handle(http.MethodGet, `/\w*`, exp.handlerGetTableItems)
 	exp.router.Handle(http.MethodGet, `/\w*/[0-9]*`, exp.handlerGetTableItem)
+	exp.router.Handle(http.MethodPut, `/\w*/`, exp.handlerCreateItem)
+}
+
+func (exp DbExplorer) createItem(table string, form map[string]any, columns []*sql.ColumnType, primaryKey string) (id any, err error) {
+	columnNames := make([]string, 0)
+	for _, c := range columns {
+		name := c.Name()
+		if name == primaryKey {
+			continue
+		}
+
+		columnNames = append(columnNames, name)
+	}
+
+	columnNamesQuery := strings.Join(columnNames, ", ")
+
+	values := make([]any, len(columnNames))
+	for i, c := range columnNames {
+		value, ok := form[c]
+		if !ok {
+			values[i] = nil
+			continue
+		}
+
+		values[i] = value
+	}
+
+	valuesPlaceholder := make([]string, len(values))
+	for i := range valuesPlaceholder {
+		valuesPlaceholder[i] = "?"
+	}
+
+	queryValuePlaceholder := strings.Join(valuesPlaceholder, ", ")
+
+	result, err := exp.DB.Exec(fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table, columnNamesQuery, queryValuePlaceholder), values...)
+	if err != nil {
+		return 0, err
+	}
+
+	lastInsertId, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+
+	return lastInsertId, err
+}
+
+func (exp DbExplorer) getPrimaryKey(table string) (string, error) {
+	rows, err := exp.DB.Query(fmt.Sprintf(`SELECT COLUMN_NAME
+    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+    WHERE TABLE_NAME = '%v'
+      AND CONSTRAINT_NAME = 'PRIMARY'
+      AND TABLE_SCHEMA = DATABASE()`, table))
+	if err != nil {
+		return "", err
+	}
+
+	defer rows.Close()
+
+	var name string
+	for rows.Next() {
+		if err := rows.Scan(&name); err != nil {
+			return "", err
+		}
+
+	}
+
+	return name, nil
+}
+
+func (exp DbExplorer) handlerCreateItem(w http.ResponseWriter, r *http.Request) {
+	tableName, err := exp.getTableName(r.URL.Path)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write(NewErrorResponse(err))
+		return
+	}
+
+	columns, err := exp.getColumnTypes(tableName)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	primaryKey, err := exp.getPrimaryKey(tableName)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	form := make(map[string]any)
+	err = json.NewDecoder(r.Body).Decode(&form)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// todo: сделать функцию валидации исходя Rows
+
+	for _, c := range columns {
+		name := c.Name()
+		if name == primaryKey {
+			continue
+		}
+
+		value, has := form[name]
+		if !has {
+			form[name] = nil
+			continue
+		}
+
+		form[name] = value
+	}
+	id, err := exp.createItem(tableName, form, columns, primaryKey)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	result := make(map[string]any)
+	result[primaryKey] = id
+
+	response := Response{
+		Response: result,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.Write(data)
 }
 
 func (exp DbExplorer) handlerGetTableNames(w http.ResponseWriter, r *http.Request) {
@@ -328,20 +419,10 @@ func (exp DbExplorer) handlerGetTableItems(w http.ResponseWriter, r *http.Reques
 	w.Write(data)
 }
 
-func (exp DbExplorer) getItem(table string, id string) (map[string]any, error) {
-	res := make(map[string]any)
-
-	row := exp.DB.QueryRow(fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table), id)
-	if row.Err() != nil {
-		return res, row.Err()
-	}
+func (exp DbExplorer) getColumnTypes(table string) ([]*sql.ColumnType, error) {
+	res := make([]*sql.ColumnType, 0)
 
 	rows, err := exp.DB.Query(fmt.Sprintf("SELECT * FROM %s LIMIT 0", table))
-	if err != nil {
-		return res, err
-	}
-
-	columns, err := rows.Columns()
 	if err != nil {
 		return res, err
 	}
@@ -351,7 +432,23 @@ func (exp DbExplorer) getItem(table string, id string) (map[string]any, error) {
 		return res, err
 	}
 
-	values := make([]any, len(columns))
+	return columnTypes, nil
+}
+
+func (exp DbExplorer) getItem(table string, id string) (map[string]any, error) {
+	res := make(map[string]any)
+
+	row := exp.DB.QueryRow(fmt.Sprintf("SELECT * FROM %s WHERE id = ?", table), id)
+	if row.Err() != nil {
+		return res, row.Err()
+	}
+
+	columnTypes, err := exp.getColumnTypes(table)
+	if err != nil {
+		return res, err
+	}
+
+	values := make([]any, len(columnTypes))
 	for i := range values {
 		if isStringType(columnTypes[i].DatabaseTypeName()) {
 			values[i] = new(sql.NullString)
@@ -369,12 +466,12 @@ func (exp DbExplorer) getItem(table string, id string) (map[string]any, error) {
 		strOrNil, ok := v.(*sql.NullString)
 		if ok {
 			if strOrNil.Valid {
-				res[columns[i]] = strOrNil.String
+				res[columnTypes[i].Name()] = strOrNil.String
 			} else {
-				res[columns[i]] = nil
+				res[columnTypes[i].Name()] = nil
 			}
 		} else {
-			res[columns[i]] = v
+			res[columnTypes[i].Name()] = v
 		}
 	}
 
