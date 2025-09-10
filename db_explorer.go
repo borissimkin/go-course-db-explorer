@@ -75,9 +75,10 @@ func (r *Router) Handle(method string, pattern string, handler http.HandlerFunc)
 }
 
 type DbExplorer struct {
-	DB         *sql.DB
-	TableNames []string
-	router     *Router
+	DB           *sql.DB
+	TableNames   []string
+	TableColumns map[string][]*sql.ColumnType
+	router       *Router
 }
 
 func isStringType(columnType string) bool {
@@ -172,10 +173,22 @@ func (exp DbExplorer) getTableNames() ([]string, error) {
 	return tableNames, nil
 }
 
+func (exp DbExplorer) initTableColumns() {
+	for _, table := range exp.TableNames {
+		columns, err := exp.getColumnTypes(table)
+		if err != nil {
+			panic(err)
+		}
+
+		exp.TableColumns[table] = columns
+	}
+}
+
 func NewDbExplorer(db *sql.DB) (DbExplorer, error) {
 	explorer := DbExplorer{
-		DB:     db,
-		router: NewRouter(),
+		DB:           db,
+		router:       NewRouter(),
+		TableColumns: make(map[string][]*sql.ColumnType),
 	}
 
 	tableNames, err := explorer.getTableNames()
@@ -185,6 +198,7 @@ func NewDbExplorer(db *sql.DB) (DbExplorer, error) {
 
 	explorer.TableNames = tableNames
 
+	explorer.initTableColumns()
 	explorer.initRoutes()
 
 	return explorer, nil
@@ -254,7 +268,7 @@ func (exp DbExplorer) handlerUpdateItem(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	columns, err := exp.getColumnTypes(tableName)
+	columns, err := exp.getColumnTypesFromCache(tableName)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -451,7 +465,7 @@ func (exp DbExplorer) handlerCreateItem(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	columns, err := exp.getColumnTypes(tableName)
+	columns, err := exp.getColumnTypesFromCache(tableName)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -623,6 +637,15 @@ func (exp DbExplorer) getColumnTypes(table string) ([]*sql.ColumnType, error) {
 	return columnTypes, nil
 }
 
+func (exp DbExplorer) getColumnTypesFromCache(table string) ([]*sql.ColumnType, error) {
+	columnTypes, ok := exp.TableColumns[table]
+	if !ok {
+		return columnTypes, fmt.Errorf("table=%s doesnt have cache", table)
+	}
+
+	return columnTypes, nil
+}
+
 func (exp DbExplorer) getItem(table string, id string) (map[string]any, error) {
 	res := make(map[string]any)
 
@@ -631,7 +654,7 @@ func (exp DbExplorer) getItem(table string, id string) (map[string]any, error) {
 		return res, row.Err()
 	}
 
-	columnTypes, err := exp.getColumnTypes(table)
+	columnTypes, err := exp.getColumnTypesFromCache(table)
 	if err != nil {
 		return res, err
 	}
