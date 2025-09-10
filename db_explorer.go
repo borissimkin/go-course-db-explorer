@@ -39,7 +39,11 @@ type GetTableItemsResponse struct {
 }
 
 type DeleteTableItemResponse struct {
-	Deleted any `json:"deleted"`
+	Deleted int `json:"deleted"`
+}
+
+type UpdateTableItemResponse struct {
+	Updated int `json:"updated"`
 }
 
 type GetTableItemResponse struct {
@@ -192,9 +196,57 @@ func (exp DbExplorer) initRoutes() {
 	exp.router.Handle(http.MethodGet, `/\w*/[0-9]*`, exp.handlerGetTableItem)
 	exp.router.Handle(http.MethodPut, `/\w*/`, exp.handlerCreateItem)
 	exp.router.Handle(http.MethodDelete, `/\w*/[0-9]*`, exp.handlerDeleteItem)
+	exp.router.Handle(http.MethodPost, `/\w*/[0-9]*`, exp.handlerUpdateItem)
 }
 
-func (exp DbExplorer) handlerDeleteItem(w http.ResponseWriter, r *http.Request) {
+/*
+*
+UPDATE table_name
+SET column1 = value1, column2 = value2, ...
+WHERE condition;
+*/
+func (exp DbExplorer) updateItem(table string, form map[string]any, columns []*sql.ColumnType, primaryKey string, pkValue any) (pk int64, err error) {
+	// todo: вынести
+	columnNames := make([]string, 0)
+	for _, c := range columns {
+		name := c.Name()
+		if name == primaryKey {
+			continue
+		}
+
+		columnNames = append(columnNames, name)
+	}
+
+	setColumnsQuery := make([]string, len(columnNames))
+	for i, c := range columnNames {
+		setColumnsQuery[i] = fmt.Sprintf("%s = ?", c)
+	}
+
+	setColumnsQueryJoined := strings.Join(setColumnsQuery, ", ")
+
+	values := make([]any, len(columnNames))
+	// todo: убрать проверку на nil и из create
+	for i, c := range columnNames {
+		values[i] = form[c]
+	}
+
+	args := make([]any, 0)
+	for _, v := range values {
+		args = append(args, v)
+	}
+	args = append(args, pkValue)
+
+	result, err := exp.DB.Exec(fmt.Sprintf("UPDATE %s SET (%s) WHERE (%s) = ?", table, setColumnsQueryJoined, primaryKey), args...)
+	if err != nil {
+		return 0, err
+	}
+
+	pk, err = result.RowsAffected()
+
+	return pk, err
+}
+
+func (exp DbExplorer) handlerUpdateItem(w http.ResponseWriter, r *http.Request) {
 	tableName, err := exp.getTableName(r.URL.Path)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
@@ -202,22 +254,57 @@ func (exp DbExplorer) handlerDeleteItem(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	id, _ := exp.getId(r.URL.Path)
-
-	pkName, err := exp.getPrimaryKey(tableName)
+	columns, err := exp.getColumnTypes(tableName)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	pk, err := exp.deleteItem(tableName, pkName, id)
+	primaryKey, err := exp.getPrimaryKey(tableName)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	result := DeleteTableItemResponse{
-		Deleted: pk,
+	form := make(map[string]any)
+	err = json.NewDecoder(r.Body).Decode(&form)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	id := exp.getId(r.URL.Path)
+
+	// todo: сделать функцию валидации исходя Rows
+
+	for _, c := range columns {
+		name := c.Name()
+		value, has := form[name]
+
+		if name == primaryKey {
+			continue
+		}
+
+		if !has {
+			form[name] = nil
+			continue
+		}
+
+		form[name] = value
+	}
+	pk, err := exp.updateItem(tableName, form, columns, primaryKey, id)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	updated := 0
+	if pk > 0 {
+		updated = 1
+	}
+
+	result := UpdateTableItemResponse{
+		Updated: updated,
 	}
 	response := Response{
 		Response: result,
@@ -232,7 +319,50 @@ func (exp DbExplorer) handlerDeleteItem(w http.ResponseWriter, r *http.Request) 
 	w.Write(data)
 }
 
-func (exp DbExplorer) deleteItem(table string, pkName string, pkValue any) (pk any, err error) {
+func (exp DbExplorer) handlerDeleteItem(w http.ResponseWriter, r *http.Request) {
+	tableName, err := exp.getTableName(r.URL.Path)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write(NewErrorResponse(err))
+		return
+	}
+
+	id := exp.getId(r.URL.Path)
+
+	pkName, err := exp.getPrimaryKey(tableName)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	pk, err := exp.deleteItem(tableName, pkName, id)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	deleted := 0
+	if pk > 0 {
+		deleted = 1
+	}
+
+	result := DeleteTableItemResponse{
+		Deleted: deleted,
+	}
+	response := Response{
+		Response: result,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.Write(data)
+}
+
+func (exp DbExplorer) deleteItem(table string, pkName string, pkValue any) (pk int64, err error) {
 	result, err := exp.DB.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s=?", table, pkName), pkValue)
 	if err != nil {
 		return pk, err
@@ -437,11 +567,10 @@ func (exp DbExplorer) getTableName(url string) (string, error) {
 	return tableName, nil
 }
 
-// todo: нужна проверка на инт?
-func (exp DbExplorer) getId(url string) (string, error) {
+func (exp DbExplorer) getId(url string) string {
 	id := strings.Split(url, "/")[2]
 
-	return id, nil
+	return id
 }
 
 func (exp DbExplorer) handlerGetTableItems(w http.ResponseWriter, r *http.Request) {
@@ -483,6 +612,8 @@ func (exp DbExplorer) getColumnTypes(table string) ([]*sql.ColumnType, error) {
 	if err != nil {
 		return res, err
 	}
+
+	defer rows.Close()
 
 	columnTypes, err := rows.ColumnTypes()
 	if err != nil {
@@ -543,7 +674,7 @@ func (exp DbExplorer) handlerGetTableItem(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	id, _ := exp.getId(r.URL.Path)
+	id := exp.getId(r.URL.Path)
 
 	item, err := exp.getItem(tableName, id)
 	if err != nil {
