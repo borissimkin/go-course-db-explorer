@@ -38,6 +38,10 @@ type GetTableItemsResponse struct {
 	Records []map[string]any `json:"records"`
 }
 
+type DeleteTableItemResponse struct {
+	Deleted any `json:"deleted"`
+}
+
 type GetTableItemResponse struct {
 	Record map[string]any `json:"record"`
 }
@@ -187,9 +191,62 @@ func (exp DbExplorer) initRoutes() {
 	exp.router.Handle(http.MethodGet, `/\w*`, exp.handlerGetTableItems)
 	exp.router.Handle(http.MethodGet, `/\w*/[0-9]*`, exp.handlerGetTableItem)
 	exp.router.Handle(http.MethodPut, `/\w*/`, exp.handlerCreateItem)
+	exp.router.Handle(http.MethodDelete, `/\w*/[0-9]*`, exp.handlerDeleteItem)
 }
 
-func (exp DbExplorer) createItem(table string, form map[string]any, columns []*sql.ColumnType, primaryKey string) (id any, err error) {
+func (exp DbExplorer) handlerDeleteItem(w http.ResponseWriter, r *http.Request) {
+	tableName, err := exp.getTableName(r.URL.Path)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write(NewErrorResponse(err))
+		return
+	}
+
+	id, _ := exp.getId(r.URL.Path)
+
+	pkName, err := exp.getPrimaryKey(tableName)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	pk, err := exp.deleteItem(tableName, pkName, id)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	result := DeleteTableItemResponse{
+		Deleted: pk,
+	}
+	response := Response{
+		Response: result,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.Write(data)
+}
+
+func (exp DbExplorer) deleteItem(table string, pkName string, pkValue any) (pk any, err error) {
+	result, err := exp.DB.Exec(fmt.Sprintf("DELETE FROM %s WHERE %s=?", table, pkName), pkValue)
+	if err != nil {
+		return pk, err
+	}
+
+	id, err := result.RowsAffected()
+	if err != nil {
+		return pk, err
+	}
+
+	return id, nil
+}
+
+func (exp DbExplorer) createItem(table string, form map[string]any, columns []*sql.ColumnType, primaryKey string) (pk any, err error) {
 	columnNames := make([]string, 0)
 	for _, c := range columns {
 		name := c.Name()
