@@ -26,6 +26,20 @@ type Router struct {
 	routes []Route
 }
 
+type ValidationError struct {
+	Field string
+}
+
+func NewValidationError(field string) ValidationError {
+	return ValidationError{
+		Field: field,
+	}
+}
+
+func (e ValidationError) Error() string {
+	return fmt.Sprintf("field %s have invalid type", e.Field)
+}
+
 type Response struct {
 	Response any `json:"response"`
 }
@@ -79,6 +93,25 @@ type DbExplorer struct {
 	TableNames   []string
 	TableColumns map[string][]*sql.ColumnType
 	router       *Router
+}
+
+type ValidationOptions struct {
+	IgnorePk               bool
+	IgnoreNotProvidedField bool
+}
+
+func isNumberType(columnType string) bool {
+	types := []string{
+		"NUMBER",
+	}
+
+	for _, v := range types {
+		if v == columnType {
+			return true
+		}
+	}
+
+	return false
 }
 
 func isStringType(columnType string) bool {
@@ -213,22 +246,36 @@ func (exp DbExplorer) initRoutes() {
 	exp.router.Handle(http.MethodPost, `/\w*/[0-9]*`, exp.handlerUpdateItem)
 }
 
-/*
-*
-UPDATE table_name
-SET column1 = value1, column2 = value2, ...
-WHERE condition;
-*/
 func (exp DbExplorer) updateItem(table string, form map[string]any, columns []*sql.ColumnType, primaryKey string, pkValue any) (pk int64, err error) {
 	// todo: вынести
-	columnNames := make([]string, 0)
-	for _, c := range columns {
-		name := c.Name()
-		if name == primaryKey {
-			continue
-		}
+	// columnNames := make([]string, 0)
+	// for _, c := range columns {
+	// 	name := c.Name()
+	// 	if name == primaryKey {
+	// 		continue
+	// 	}
 
-		columnNames = append(columnNames, name)
+	// 	columnNames = append(columnNames, name)
+	// }
+
+	// setColumnsQuery := make([]string, len(columnNames))
+	// for i, c := range columnNames {
+	// 	setColumnsQuery[i] = fmt.Sprintf("%s = ?", c)
+	// }
+
+	// setColumnsQueryJoined := strings.Join(setColumnsQuery, ", ")
+
+	// values := make([]any, len(columnNames))
+	// // todo: убрать проверку на nil и из create
+	// for i, c := range columnNames {
+	// 	values[i] = form[c]
+	// }
+
+	columnNames := make([]string, 0)
+	values := make([]any, 0)
+	for k, v := range form {
+		columnNames = append(columnNames, k)
+		values = append(values, v)
 	}
 
 	setColumnsQuery := make([]string, len(columnNames))
@@ -238,19 +285,14 @@ func (exp DbExplorer) updateItem(table string, form map[string]any, columns []*s
 
 	setColumnsQueryJoined := strings.Join(setColumnsQuery, ", ")
 
-	values := make([]any, len(columnNames))
-	// todo: убрать проверку на nil и из create
-	for i, c := range columnNames {
-		values[i] = form[c]
-	}
-
 	args := make([]any, 0)
-	for _, v := range values {
-		args = append(args, v)
-	}
+	args = append(args, values...)
+
 	args = append(args, pkValue)
 
-	result, err := exp.DB.Exec(fmt.Sprintf("UPDATE %s SET (%s) WHERE (%s) = ?", table, setColumnsQueryJoined, primaryKey), args...)
+	// todo "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '(description = ?) WHERE id = ?' at line 1"
+
+	result, err := exp.DB.Exec(fmt.Sprintf("UPDATE %s SET (%s) WHERE %s = ?", table, setColumnsQueryJoined, primaryKey), args...)
 	if err != nil {
 		return 0, err
 	}
@@ -258,6 +300,57 @@ func (exp DbExplorer) updateItem(table string, form map[string]any, columns []*s
 	pk, err = result.RowsAffected()
 
 	return pk, err
+}
+
+func (exp DbExplorer) processForm(form map[string]any, columns []*sql.ColumnType, primaryKey string, validationOptions ValidationOptions) error {
+	for _, c := range columns {
+		name := c.Name()
+		value, has := form[name]
+		nullable, ok := c.Nullable()
+		if !ok {
+			return fmt.Errorf("db driver does not support nullable")
+		}
+
+		if name == primaryKey {
+			if has && !validationOptions.IgnorePk {
+				return NewValidationError(name)
+			}
+			continue
+		}
+
+		if has {
+			switch value.(type) {
+			case float64:
+				if !isNumberType(c.DatabaseTypeName()) {
+					return NewValidationError(name)
+				}
+
+			case string:
+				if !isStringType(c.DatabaseTypeName()) {
+					return NewValidationError(name)
+				}
+			case nil:
+				if !nullable {
+					return NewValidationError(name)
+				}
+			}
+
+			form[name] = value
+			continue
+		}
+
+		if validationOptions.IgnoreNotProvidedField {
+			continue
+		}
+
+		if !nullable {
+			return NewValidationError(name)
+		}
+
+		form[name] = nil
+	}
+
+	return nil
 }
 
 func (exp DbExplorer) handlerUpdateItem(w http.ResponseWriter, r *http.Request) {
@@ -289,23 +382,17 @@ func (exp DbExplorer) handlerUpdateItem(w http.ResponseWriter, r *http.Request) 
 
 	id := exp.getId(r.URL.Path)
 
-	// todo: сделать функцию валидации исходя Rows
+	err = exp.processForm(form, columns, primaryKey, ValidationOptions{
+		IgnorePk:               false,
+		IgnoreNotProvidedField: true,
+	})
 
-	for _, c := range columns {
-		name := c.Name()
-		value, has := form[name]
-
-		if name == primaryKey {
-			continue
-		}
-
-		if !has {
-			form[name] = nil
-			continue
-		}
-
-		form[name] = value
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write(NewErrorResponse(err))
+		return
 	}
+
 	pk, err := exp.updateItem(tableName, form, columns, primaryKey, id)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
